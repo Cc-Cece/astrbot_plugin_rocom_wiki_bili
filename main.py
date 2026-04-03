@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from html import unescape
 import sqlite3
 import time
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -271,6 +278,266 @@ def _summary_from_content(title: str, markdown_text: str, wikitext: str, params:
     return _shorten(summary, limit)
 
 
+def _config_str(config: dict[str, Any], key: str, default: str = "") -> str:
+    value = config.get(key, default)
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def _config_int(config: dict[str, Any], key: str, default: int) -> int:
+    value = config.get(key, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "是", "启用", "开启"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "否", "关闭"}:
+            return False
+    return bool(value)
+
+
+def _normalize_source_mode(value: str) -> str:
+    normalized = (value or "auto").strip().lower()
+    if normalized in {"sqlite-only", "sqlite_only"}:
+        return "sqlite_only"
+    if normalized in {"jsonl-only", "jsonl_only"}:
+        return "jsonl_only"
+    if normalized in {"sqlite-jsonl-merge", "sqlite_jsonl_merge", "merge"}:
+        return "sqlite_jsonl_merge"
+    if normalized in {"crawler-only", "crawler_only"}:
+        return "crawler_only"
+    return "auto"
+
+
+def _normalize_update_mode(value: str) -> str:
+    normalized = (value or "after_send_compare_update").strip().lower()
+    if normalized in {"before_send_compare_update", "before", "pre"}:
+        return "before_send_compare_update"
+    if normalized in {"disabled", "off", "none"}:
+        return "disabled"
+    return "after_send_compare_update"
+
+
+class MediaWikiClient:
+    def __init__(self, api_url: str = "https://wiki.biligame.com/rocom/api.php", user_agent: str = "astrbot-plugin-rocom-wiki-bili/1.0.2") -> None:
+        self.api_url = api_url
+        self.user_agent = user_agent
+
+    def _headers(self, referer: str | None = None) -> dict[str, str]:
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        if referer:
+            headers["Referer"] = referer
+        return headers
+
+    def get_json(self, params: dict[str, Any]) -> dict[str, Any]:
+        query = urlencode(params, doseq=True)
+        request = Request(
+            f"{self.api_url}?{query}",
+            headers=self._headers("https://wiki.biligame.com/rocom/"),
+        )
+        retries = 3
+        for attempt in range(retries):
+            try:
+                with urlopen(request, timeout=20) as response:
+                    payload = response.read().decode("utf-8")
+                data = json.loads(payload)
+                return data if isinstance(data, dict) else {}
+            except HTTPError as error:
+                if error.code not in {429, 500, 502, 503, 504} or attempt >= retries - 1:
+                    raise
+                time.sleep(1.2 * (attempt + 1))
+            except URLError:
+                if attempt >= retries - 1:
+                    raise
+                time.sleep(1.2 * (attempt + 1))
+        raise RuntimeError("Failed to fetch JSON from MediaWiki API")
+
+    def get_text(self, url: str, referer: str | None = None) -> str:
+        request = Request(url, headers=self._headers(referer))
+        with urlopen(request, timeout=20) as response:
+            return response.read().decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _strip_html_tags(text: str) -> str:
+        text = re.sub(r"<script\b.*?</script>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<style\b.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = unescape(text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _search_titles_from_html(self, keyword: str, limit: int = 8) -> list[str]:
+        search_url = "https://searchwiki.biligame.com/rocom/index.php?" + urlencode(
+            {
+                "search": keyword,
+                "title": "Special:搜索",
+            }
+        )
+        html = self.get_text(search_url, referer="https://searchwiki.biligame.com/rocom/")
+        pattern = re.compile(
+            r'<a[^>]+href="https://searchwiki\.biligame\.com/rocom/([^"#?]+)"[^>]*>(.*?)</a>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        titles: list[str] = []
+        for href, anchor in pattern.findall(html):
+            title = unquote(href).strip()
+            if not title or title.lower().startswith("special:"):
+                continue
+            text = self._strip_html_tags(anchor)
+            candidate = text or title
+            candidate = candidate.split(" ", 1)[0].strip()
+            if candidate and candidate not in titles:
+                titles.append(candidate)
+            if len(titles) >= limit:
+                break
+        if not titles:
+            alt_pattern = re.compile(r'<a[^>]+href="/rocom/([^"#?]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+            for href, anchor in alt_pattern.findall(html):
+                title = unquote(href).strip()
+                if not title or title.lower().startswith("special:"):
+                    continue
+                text = self._strip_html_tags(anchor)
+                candidate = text or title
+                candidate = candidate.split(" ", 1)[0].strip()
+                if candidate and candidate not in titles:
+                    titles.append(candidate)
+                if len(titles) >= limit:
+                    break
+        return titles[:limit]
+
+    def search_titles(self, keyword: str, limit: int = 8) -> list[str]:
+        try:
+            data = self.get_json(
+                {
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": keyword,
+                    "srlimit": max(1, min(20, limit)),
+                    "srnamespace": 0,
+                    "format": "json",
+                    "formatversion": 2,
+                }
+            )
+            results = data.get("query", {}).get("search", [])
+            titles: list[str] = []
+            for item in results:
+                title = item.get("title")
+                if title:
+                    titles.append(str(title))
+            if titles:
+                return titles
+        except Exception as exc:
+            logger.warning(f"[rocom] API 搜索失败，切换 HTML 搜索页：{exc}")
+
+        try:
+            return self._search_titles_from_html(keyword, limit=max(1, min(20, limit)))
+        except Exception as exc:
+            logger.warning(f"[rocom] HTML 搜索失败：{exc}")
+            return []
+
+    def page(
+        self,
+        title: str,
+        *,
+        include_links: bool = True,
+        include_images: bool = True,
+        include_categories: bool = True,
+    ) -> dict[str, Any]:
+        data = self.get_json(
+            {
+                "action": "query",
+                "titles": title,
+                "prop": "info|revisions|extracts",
+                "inprop": "url",
+                "rvprop": "ids|timestamp|user|comment|content",
+                "rvslots": "main",
+                "explaintext": 1,
+                "exintro": 1,
+                "exsectionformat": "plain",
+                "format": "json",
+            }
+        )
+        pages = data.get("query", {}).get("pages", {})
+        page_data = next(iter(pages.values()), {}) if isinstance(pages, dict) else {}
+        revisions = page_data.get("revisions", []) if isinstance(page_data, dict) else []
+        revision = revisions[0] if revisions else {}
+        slots = revision.get("slots", {}) if isinstance(revision, dict) else {}
+        main_slot = slots.get("main", {}) if isinstance(slots, dict) else {}
+        revision_text = None
+        if isinstance(main_slot, dict):
+            revision_text = main_slot.get("*") or main_slot.get("content")
+
+        result = {
+            "title": page_data.get("title", title),
+            "pageid": page_data.get("pageid"),
+            "ns": page_data.get("ns"),
+            "url": page_data.get("fullurl"),
+            "touched": page_data.get("touched"),
+            "lastrevid": page_data.get("lastrevid") or revision.get("revid"),
+            "contentmodel": page_data.get("contentmodel"),
+            "extract": page_data.get("extract"),
+            "wikitext": revision_text,
+            "categories": [],
+            "links": [],
+            "images": [],
+        }
+
+        if include_categories:
+            result["categories"] = self._collect_titles(title, "categories", "title")
+        if include_links:
+            result["links"] = self._collect_titles(title, "links", "title", {"plnamespace": 0})
+        if include_images:
+            result["images"] = self._collect_titles(title, "images", "title")
+
+        return result
+
+    def _collect_titles(self, title: str, prop: str, item_key: str, extra_params: dict[str, Any] | None = None) -> list[str]:
+        results: list[str] = []
+        continue_params: dict[str, Any] | None = None
+
+        while True:
+            params: dict[str, Any] = {
+                "action": "query",
+                "titles": title,
+                "prop": prop,
+                "format": "json",
+            }
+            if extra_params:
+                params.update(extra_params)
+            if continue_params:
+                params.update(continue_params)
+
+            data = self.get_json(params)
+            pages = data.get("query", {}).get("pages", {})
+            page_data = next(iter(pages.values()), {}) if isinstance(pages, dict) else {}
+            items = page_data.get(prop, []) if isinstance(page_data, dict) else []
+            results.extend(item.get(item_key, "") for item in items if item.get(item_key))
+
+            continue_params = data.get("continue")
+            if not continue_params:
+                break
+
+        return results
+
+
 @dataclass(slots=True)
 class CacheEntry:
     value: str
@@ -280,41 +547,94 @@ class CacheEntry:
 @dataclass(slots=True)
 class PendingSelection:
     keyword: str
-    titles: list[str]
+    records: list[dict[str, Any]]
     ts: float
 
 
 class RocomRepository:
-    def __init__(self, sqlite_path: Path, markdown_root: Path) -> None:
+    def __init__(self, sqlite_path: Path, jsonl_path: Path, markdown_root: Path) -> None:
         self.sqlite_path = sqlite_path
+        self.jsonl_path = jsonl_path
         self.markdown_root = markdown_root
+        self._jsonl_records: list[dict[str, Any]] | None = None
 
     def is_ready(self) -> bool:
-        return self.sqlite_path.exists()
+        return self.sqlite_path.exists() or self.jsonl_path.exists()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.sqlite_path)
         connection.row_factory = sqlite3.Row
         return connection
 
-    def _fetch_one(self, query: str, params: tuple[object, ...]) -> sqlite3.Row | None:
+    @staticmethod
+    def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys()}
+
+    def _fetch_one(self, query: str, params: tuple[object, ...]) -> dict[str, Any] | None:
         with self._connect() as conn:
-            return conn.execute(query, params).fetchone()
+            row = conn.execute(query, params).fetchone()
+        return self._row_to_dict(row)
 
     def _fetch_many(
         self,
         query: str,
         params: tuple[object, ...],
         limit: int,
-    ) -> list[sqlite3.Row]:
+    ) -> list[dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return list(rows)[:limit]
+        return [self._row_to_dict(row) for row in list(rows)[:limit] if row is not None]
 
-    def query_title_contains(self, keyword: str, limit: int = 8) -> list[sqlite3.Row]:
+    def _load_jsonl_records(self) -> list[dict[str, Any]]:
+        if self._jsonl_records is not None:
+            return self._jsonl_records
+        if not self.jsonl_path.exists():
+            self._jsonl_records = []
+            return self._jsonl_records
+
+        records: list[dict[str, Any]] = []
+        with self.jsonl_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and item.get("title"):
+                    records.append(item)
+        self._jsonl_records = records
+        return records
+
+    @staticmethod
+    def _sort_query_rows(rows: list[dict[str, Any]], keyword: str) -> list[dict[str, Any]]:
+        unique: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            title = str(row.get("title") or "")
+            if title and title not in unique:
+                unique[title] = row
+
+        def sort_key(row: dict[str, Any]) -> tuple[int, int, str]:
+            title = str(row.get("title") or "")
+            if title == keyword:
+                rank = 0
+            elif title.startswith(keyword):
+                rank = 1
+            else:
+                rank = 2
+            return (rank, len(title), title)
+
+        return sorted(unique.values(), key=sort_key)
+
+    def query_sqlite_title_contains(self, keyword: str, limit: int = 8) -> list[dict[str, Any]]:
+        if not self.sqlite_path.exists():
+            return []
         return self._fetch_many(
             """
-            SELECT title, extract, wikitext, touched
+            SELECT title, pageid, ns, url, touched, lastrevid, contentmodel, extract, wikitext, categories, links, images, depth
             FROM pages
             WHERE title LIKE ?
             ORDER BY CASE WHEN title = ? THEN 0 WHEN title LIKE ? THEN 1 ELSE 2 END, LENGTH(title)
@@ -324,16 +644,28 @@ class RocomRepository:
             limit,
         )
 
-    def get_page_by_title(self, title: str) -> sqlite3.Row | None:
+    def query_jsonl_title_contains(self, keyword: str, limit: int = 8) -> list[dict[str, Any]]:
+        rows = [record for record in self._load_jsonl_records() if keyword.lower() in str(record.get("title") or "").lower()]
+        return self._sort_query_rows(rows, keyword)[:limit]
+
+    def get_sqlite_page_by_title(self, title: str) -> dict[str, Any] | None:
+        if not self.sqlite_path.exists():
+            return None
         return self._fetch_one(
             """
-            SELECT title, extract, wikitext, touched, url, images, categories, links
+            SELECT title, pageid, ns, url, touched, lastrevid, contentmodel, extract, wikitext, categories, links, images, depth
             FROM pages
             WHERE title = ?
             LIMIT 1
             """,
             (title,),
         )
+
+    def get_jsonl_page_by_title(self, title: str) -> dict[str, Any] | None:
+        for record in self._load_jsonl_records():
+            if str(record.get("title") or "") == title:
+                return record
+        return None
 
     def read_markdown_raw(self, title: str) -> str:
         for candidate in self._iter_markdown_paths(title):
@@ -349,6 +681,101 @@ class RocomRepository:
             seen.add(name)
             yield self.markdown_root / f"{name}.md"
 
+    def _upsert_page_sqlite(self, record: dict[str, Any]) -> bool:
+        if not self.sqlite_path.exists():
+            return False
+
+        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        categories = record.get("categories", [])
+        links = record.get("links", [])
+        images = record.get("images", [])
+        if not isinstance(categories, str):
+            categories = json.dumps(categories, ensure_ascii=False)
+        if not isinstance(links, str):
+            links = json.dumps(links, ensure_ascii=False)
+        if not isinstance(images, str):
+            images = json.dumps(images, ensure_ascii=False)
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO pages (
+                    title, pageid, ns, url, touched, lastrevid, contentmodel,
+                    extract, wikitext, categories, links, images, depth
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(title) DO UPDATE SET
+                    pageid=excluded.pageid,
+                    ns=excluded.ns,
+                    url=excluded.url,
+                    touched=excluded.touched,
+                    lastrevid=excluded.lastrevid,
+                    contentmodel=excluded.contentmodel,
+                    extract=excluded.extract,
+                    wikitext=excluded.wikitext,
+                    categories=excluded.categories,
+                    links=excluded.links,
+                    images=excluded.images,
+                    depth=excluded.depth
+                """,
+                (
+                    record.get("title"),
+                    record.get("pageid"),
+                    record.get("ns"),
+                    record.get("url"),
+                    record.get("touched"),
+                    record.get("lastrevid"),
+                    record.get("contentmodel"),
+                    record.get("extract"),
+                    record.get("wikitext"),
+                    categories,
+                    links,
+                    images,
+                    record.get("depth"),
+                ),
+            )
+            conn.commit()
+        return True
+
+    def _upsert_page_jsonl(self, record: dict[str, Any]) -> bool:
+        if not self.jsonl_path.exists():
+            return False
+
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        title = str(record.get("title") or "").strip()
+        if not title:
+            return False
+
+        records = self._load_jsonl_records()
+        replaced = False
+        for idx, item in enumerate(records):
+            if str(item.get("title") or "") == title:
+                records[idx] = dict(record)
+                replaced = True
+                break
+        if not replaced:
+            records.append(dict(record))
+
+        with self.jsonl_path.open("w", encoding="utf-8") as handle:
+            for item in records:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+        self._jsonl_records = records
+        return True
+
+    def upsert_page(
+        self,
+        record: dict[str, Any],
+        *,
+        write_sqlite: bool = True,
+        write_jsonl: bool = True,
+    ) -> bool:
+        wrote_any = False
+        if write_sqlite:
+            wrote_any = self._upsert_page_sqlite(record) or wrote_any
+        if write_jsonl:
+            wrote_any = self._upsert_page_jsonl(record) or wrote_any
+        return wrote_any
+
 
 @register("astrbot_plugin_rocom_wiki_bili", "Kanbara", "洛克王国 Wiki 本地查询插件", "1.0.0")
 class RocomWikiPlugin(Star):
@@ -358,18 +785,20 @@ class RocomWikiPlugin(Star):
         self.config = config or {}
         self._cache: dict[str, CacheEntry] = {}
         self._pending: dict[str, PendingSelection] = {}
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self.repo: RocomRepository | None = None
 
     async def initialize(self):
         self.repo = RocomRepository(
             sqlite_path=self._resolve_sqlite_path(),
+            jsonl_path=self._resolve_jsonl_path(),
             markdown_root=self._resolve_markdown_root(),
         )
-        logger.info(f"[rocom] 插件初始化完成，sqlite={self.repo.sqlite_path}")
+        logger.info(f"[rocom] 插件初始化完成，sqlite={self.repo.sqlite_path}, jsonl={self.repo.jsonl_path}")
 
     def _resolve_sqlite_path(self) -> Path:
         plugin_root = Path(__file__).resolve().parent
-        configured = str(self.config.get("sqlite_path") or "").strip()
+        configured = _config_str(self.config, "sqlite_path", "")
         candidates: list[Path] = []
         if configured:
             p = Path(configured)
@@ -381,9 +810,23 @@ class RocomWikiPlugin(Star):
                 return candidate
         return candidates[0]
 
+    def _resolve_jsonl_path(self) -> Path:
+        plugin_root = Path(__file__).resolve().parent
+        configured = _config_str(self.config, "jsonl_path", "")
+        candidates: list[Path] = []
+        if configured:
+            p = Path(configured)
+            candidates.append(p if p.is_absolute() else (plugin_root / p).resolve())
+        candidates.append((plugin_root / "data" / "pages.jsonl").resolve())
+        candidates.append((plugin_root.parent / "data" / "pages.jsonl").resolve())
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return candidates[0]
+
     def _resolve_markdown_root(self) -> Path:
         plugin_root = Path(__file__).resolve().parent
-        configured = str(self.config.get("markdown_root") or "").strip()
+        configured = _config_str(self.config, "markdown_root", "")
         candidates: list[Path] = []
         if configured:
             p = Path(configured)
@@ -396,7 +839,7 @@ class RocomWikiPlugin(Star):
         return candidates[0]
 
     def _cache_ttl(self) -> int:
-        return int(self.config.get("cache_ttl_sec", 600) or 600)
+        return _config_int(self.config, "cache_ttl_sec", 600)
 
     def _pending_ttl(self) -> int:
         return max(120, min(1800, self._cache_ttl()))
@@ -414,17 +857,154 @@ class RocomWikiPlugin(Star):
         self._cache[key] = CacheEntry(value=value, ts=time.time())
 
     def _compact_mode(self) -> bool:
-        return str(self.config.get("default_reply_mode", "compact")) != "full"
+        return _config_str(self.config, "default_reply_mode", "compact").lower() != "full"
 
     def _query_limit(self) -> int:
-        return max(1, min(20, int(self.config.get("query_max_results", 8) or 8)))
+        return max(1, min(20, _config_int(self.config, "query_max_results", 8)))
+
+    def _source_mode(self) -> str:
+        return _normalize_source_mode(_config_str(self.config, "source_mode", "auto"))
+
+    def _update_mode(self) -> str:
+        return _normalize_update_mode(_config_str(self.config, "update_mode", "after_send_compare_update"))
+
+    def _crawler_enabled(self) -> bool:
+        return _config_bool(self.config, "crawler_enabled", True)
+
+    def _crawler_timeout(self) -> int:
+        return max(1, _config_int(self.config, "crawler_timeout_sec", 20))
+
+    def _crawler_min_interval(self) -> int:
+        return max(0, _config_int(self.config, "crawler_min_interval_sec", 5))
+
+    def _recall_on_update(self) -> bool:
+        return _config_bool(self.config, "recall_on_update", True)
 
     def _forward_enabled(self) -> bool:
-        return bool(self.config.get("merge_forward_enabled", True))
+        return _config_bool(self.config, "merge_forward_enabled", True)
 
     def _forward_platforms(self) -> set[str]:
-        raw = str(self.config.get("merge_forward_platforms", "aiocqhttp,onebot")).strip()
+        raw = _config_str(self.config, "merge_forward_platforms", "aiocqhttp,onebot")
         return {item.lower() for item in _split_csv(raw)}
+
+    def _query_local_records(self, keyword: str) -> list[dict[str, Any]]:
+        if not self.repo:
+            return []
+
+        mode = self._source_mode()
+        rows: list[dict[str, Any]] = []
+
+        if mode == "auto":
+            if self.repo.sqlite_path.exists():
+                rows.extend(self.repo.query_sqlite_title_contains(keyword, limit=self._query_limit()))
+            elif self.repo.jsonl_path.exists():
+                rows.extend(self.repo.query_jsonl_title_contains(keyword, limit=self._query_limit()))
+        elif mode in {"sqlite_only", "sqlite_jsonl_merge"} and self.repo.sqlite_path.exists():
+            rows.extend(self.repo.query_sqlite_title_contains(keyword, limit=self._query_limit()))
+        if mode in {"jsonl_only", "sqlite_jsonl_merge"} and self.repo.jsonl_path.exists():
+            rows.extend(self.repo.query_jsonl_title_contains(keyword, limit=self._query_limit()))
+
+        return self.repo._sort_query_rows(rows, keyword)[: self._query_limit()]
+
+    def _parse_query_message(self, event: AstrMessageEvent, keyword: str) -> tuple[str, int | None]:
+        raw_text = event.get_message_str().strip()
+        extracted = keyword.strip()
+
+        match = re.match(r"^(?:[#/]\s*)?(?:洛克查|洛克查询|查百科|查词条)\s+(.*)$", raw_text)
+        if match:
+            extracted = match.group(1).strip()
+
+        selected_index: int | None = None
+        if extracted:
+            parts = extracted.rsplit(None, 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                selected_index = int(parts[1])
+                extracted = parts[0].strip()
+
+        return extracted or keyword.strip(), selected_index
+
+    def _query_remote_records(self, keyword: str) -> list[dict[str, Any]]:
+        if not self._crawler_enabled() or self._source_mode() not in {"auto", "crawler_only"}:
+            return []
+
+        client = MediaWikiClient()
+        try:
+            titles = client.search_titles(keyword, limit=self._query_limit())
+        except Exception as exc:
+            logger.warning(f"[rocom] 在线搜索失败：{exc}")
+            return []
+
+        records: list[dict[str, Any]] = []
+        for title in titles:
+            try:
+                record = client.page(title)
+            except Exception as exc:
+                logger.warning(f"[rocom] 在线抓取失败：{title} -> {exc}")
+                continue
+            records.append(record)
+            self._upsert_record_if_allowed(record)
+
+        return RocomRepository._sort_query_rows(records, keyword)[: self._query_limit()]
+
+    def _fetch_remote_page(self, title: str) -> dict[str, Any] | None:
+        if not self._crawler_enabled():
+            return None
+        try:
+            record = MediaWikiClient().page(title)
+        except Exception as exc:
+            logger.warning(f"[rocom] 在线抓取详情失败：{title} -> {exc}")
+            return None
+        self._upsert_record_if_allowed(record)
+        return record
+
+    @staticmethod
+    def _record_revision(record: dict[str, Any] | None) -> str:
+        if not record:
+            return ""
+        return str(record.get("lastrevid") or record.get("touched") or "")
+
+    @staticmethod
+    def _record_payload(record: dict[str, Any] | None) -> str:
+        if not record:
+            return ""
+        return json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _record_needs_update(self, local_record: dict[str, Any], remote_record: dict[str, Any]) -> bool:
+        local_rev = self._record_revision(local_record)
+        remote_rev = self._record_revision(remote_record)
+        if local_rev and remote_rev and local_rev != remote_rev:
+            return True
+        return self._record_payload(local_record) != self._record_payload(remote_record)
+
+    def _allow_remote_search(self) -> bool:
+        return self._crawler_enabled() and self._source_mode() in {"auto", "crawler_only"}
+
+    def _allow_remote_update(self) -> bool:
+        return self._crawler_enabled() and self._source_mode() != "crawler_only" and self._update_mode() != "disabled"
+
+    def _should_touch_local_storage(self) -> bool:
+        return self._source_mode() != "crawler_only"
+
+    def _upsert_record_if_allowed(self, record: dict[str, Any]) -> None:
+        if not self.repo or not self._should_touch_local_storage():
+            return
+        self.repo.upsert_page(record, write_sqlite=True, write_jsonl=True)
+
+    def _refresh_record_if_needed(self, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        if not self._allow_remote_update():
+            return record, False
+
+        title = str(record.get("title") or "")
+        if not title:
+            return record, False
+
+        remote_record = self._fetch_remote_page(title)
+        if not remote_record:
+            return record, False
+
+        if self._record_needs_update(record, remote_record):
+            return remote_record, True
+        return record, False
 
     def _supports_forward(self, event: AstrMessageEvent) -> bool:
         if not self._forward_enabled():
@@ -733,20 +1313,32 @@ class RocomWikiPlugin(Star):
             )
         )
 
+        nodes.append(
+            Node(
+                uin=event.get_self_id(),
+                name="洛克百科",
+                content=[Plain(self._build_original_wiki_text(row))],
+            )
+        )
+
         result = event.make_result()
         result.chain.append(Nodes(nodes))
         return result
 
     def _ensure_repo(self) -> str | None:
+        if self._source_mode() == "crawler_only":
+            return None
         if self.repo is None:
             self.repo = RocomRepository(
                 sqlite_path=self._resolve_sqlite_path(),
+                jsonl_path=self._resolve_jsonl_path(),
                 markdown_root=self._resolve_markdown_root(),
             )
         if not self.repo.is_ready():
             return (
-                "本地数据未就绪，请检查 sqlite_path 配置。\n"
-                f"当前路径：{self.repo.sqlite_path}"
+                "本地数据未就绪，请检查 sqlite_path/jsonl_path 配置。\n"
+                f"SQLite：{self.repo.sqlite_path}\n"
+                f"JSONL：{self.repo.jsonl_path}"
             )
         return None
 
@@ -762,11 +1354,176 @@ class RocomWikiPlugin(Star):
             return None
         return pending
 
-    def _pending_set(self, key: str, keyword: str, titles: list[str]) -> None:
-        self._pending[key] = PendingSelection(keyword=keyword, titles=titles, ts=time.time())
+    def _pending_set(self, key: str, keyword: str, records: list[dict[str, Any]]) -> None:
+        self._pending[key] = PendingSelection(keyword=keyword, records=records, ts=time.time())
 
     def _pending_clear(self, key: str) -> None:
         self._pending.pop(key, None)
+
+    def _track_background_task(self, task: asyncio.Task[None]) -> None:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _cancel_background_tasks(self) -> None:
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
+
+    async def _send_result(self, event: AstrMessageEvent, result: Any) -> None:
+        await event.send(result)
+
+    async def _send_results(self, event: AstrMessageEvent, results: list[Any]) -> None:
+        for result in results:
+            await self._send_result(event, result)
+
+    def _build_detail_delivery_result(
+        self,
+        event: AstrMessageEvent,
+        row: sqlite3.Row | dict[str, Any],
+        keyword: str = "",
+        selected_index: int | None = None,
+        total: int | None = None,
+    ):
+        if self._supports_forward(event):
+            return self._build_detail_forward_result(
+                event,
+                row,
+                keyword=keyword,
+                selected_index=selected_index,
+                total=total,
+            )
+
+        result = self._build_detail_result(event, row)
+        result.chain.append(Plain(f"\n{self._build_original_wiki_text(row)}"))
+        return result
+
+    async def _query_local_records_async(self, keyword: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._query_local_records, keyword)
+
+    async def _query_remote_records_async(self, keyword: str) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(self._query_remote_records, keyword)
+
+    async def _refresh_record_if_needed_async(self, record: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        return await asyncio.to_thread(self._refresh_record_if_needed, record)
+
+    async def _deliver_detail_async(
+        self,
+        event: AstrMessageEvent,
+        row: sqlite3.Row | dict[str, Any],
+        *,
+        keyword: str = "",
+        selected_index: int | None = None,
+        total: int | None = None,
+    ) -> None:
+        record = dict(row)
+        if self._update_mode() == "before_send_compare_update":
+            record, _ = await self._refresh_record_if_needed_async(record)
+
+        await self._send_result(
+            event,
+            self._build_detail_delivery_result(
+                event,
+                record,
+                keyword=keyword,
+                selected_index=selected_index,
+                total=total,
+            ).stop_event(),
+        )
+
+        if self._update_mode() == "after_send_compare_update":
+            await self._refresh_record_if_needed_async(record)
+
+    async def _deliver_query_results_async(
+        self,
+        event: AstrMessageEvent,
+        keyword: str,
+        selected_index_hint: int | None,
+    ) -> None:
+        err = self._ensure_repo()
+        if err:
+            await self._send_result(event, event.plain_result(err))
+            return
+
+        try:
+            rows = await self._query_local_records_async(keyword)
+            if not rows and self._allow_remote_search():
+                rows = await self._query_remote_records_async(keyword)
+
+            if not rows:
+                cache_key = f"miss:{keyword}:{self._query_limit()}"
+                text = self._cache_get(cache_key) or f"未找到关键词“{keyword}”相关内容。"
+                self._cache_set(cache_key, text)
+                await self._send_result(event, event.plain_result(text))
+                return
+
+            selection_key = self._selection_key(event)
+            if len(rows) == 1:
+                self._pending_clear(selection_key)
+                await self._deliver_detail_async(event, rows[0])
+                return
+
+            if selected_index_hint is not None and 1 <= selected_index_hint <= len(rows):
+                self._pending_clear(selection_key)
+                await self._deliver_detail_async(
+                    event,
+                    rows[selected_index_hint - 1],
+                    keyword=keyword,
+                    selected_index=selected_index_hint,
+                    total=len(rows),
+                )
+                return
+
+            self._pending_set(selection_key, keyword, rows)
+            await self._send_result(event, event.plain_result(self._format_selection_text(keyword, rows)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[rocom] 查询失败：{exc}")
+            await self._send_result(event, event.plain_result(f"查询失败：{exc}"))
+
+    async def _deliver_selected_index_async(
+        self,
+        event: AstrMessageEvent,
+        pending: PendingSelection,
+        index: int,
+    ) -> None:
+        selection_key = self._selection_key(event)
+        if index == 0:
+            self._pending_clear(selection_key)
+            await self._send_result(event, event.plain_result("已取消本次词条选择。").stop_event())
+            return
+
+        if index < 1 or index > len(pending.records):
+            await self._send_result(
+                event,
+                event.plain_result(f"请输入 1 到 {len(pending.records)} 之间的序号，或回复 0 取消。").stop_event(),
+            )
+            return
+
+        self._pending_clear(selection_key)
+        await self._deliver_detail_async(
+            event,
+            pending.records[index - 1],
+            keyword=pending.keyword,
+            selected_index=index,
+            total=len(pending.records),
+        )
+
+    async def _query_request_async(
+        self,
+        event: AstrMessageEvent,
+        keyword: str,
+        selected_index_hint: int | None,
+    ) -> None:
+        await self._deliver_query_results_async(event, keyword, selected_index_hint)
+
+    async def _select_request_async(
+        self,
+        event: AstrMessageEvent,
+        pending: PendingSelection,
+        index: int,
+    ) -> None:
+        await self._deliver_selected_index_async(event, pending, index)
 
     @filter.command("洛克帮助", alias={"洛克help", "百科帮助"})
     async def rocom_help(self, event: AstrMessageEvent):
@@ -774,33 +1531,16 @@ class RocomWikiPlugin(Star):
 
     @filter.command("洛克查", alias={"洛克查询", "查百科", "查词条"})
     async def rocom_query(self, event: AstrMessageEvent, keyword: str = ""):
-        keyword = keyword.strip()
-        if not keyword:
+        raw_keyword = keyword.strip()
+        if not raw_keyword:
             yield event.plain_result("请输入关键词，例如：洛克查 小独角兽")
             return
 
-        err = self._ensure_repo()
-        if err:
-            yield event.plain_result(err)
-            return
-
-        cache_key = f"miss:{keyword}:{self._query_limit()}"
-        rows = self.repo.query_title_contains(keyword, limit=self._query_limit())
-        if not rows:
-            text = self._cache_get(cache_key) or f"未找到关键词“{keyword}”相关内容。"
-            self._cache_set(cache_key, text)
-            yield event.plain_result(text)
-            return
-
-        selection_key = self._selection_key(event)
-        if len(rows) == 1:
-            self._pending_clear(selection_key)
-            yield self._build_detail_result(event, rows[0]).stop_event()
-            yield self._build_original_wiki_result(event, rows[0]).stop_event()
-            return
-
-        self._pending_set(selection_key, keyword, [str(row["title"] or "") for row in rows])
-        yield event.plain_result(self._format_selection_text(keyword, rows))
+        keyword, selected_index_hint = self._parse_query_message(event, raw_keyword)
+        self._pending_clear(self._selection_key(event))
+        task = asyncio.create_task(self._query_request_async(event, keyword, selected_index_hint))
+        self._track_background_task(task)
+        return
 
     @filter.regex(r"^\s*\d+\s*$")
     async def rocom_select_by_index(self, event: AstrMessageEvent):
@@ -815,39 +1555,9 @@ class RocomWikiPlugin(Star):
 
         raw = event.get_message_str().strip()
         index = int(raw)
-
-        if index == 0:
-            self._pending_clear(self._selection_key(event))
-            yield event.plain_result("已取消本次词条选择。").stop_event()
-            return
-
-        if index < 1 or index > len(pending.titles):
-            yield event.plain_result(
-                f"请输入 1 到 {len(pending.titles)} 之间的序号，或回复 0 取消。"
-            ).stop_event()
-            return
-
-        title = pending.titles[index - 1]
-        row = self.repo.get_page_by_title(title)
-        if not row:
-            self._pending_clear(self._selection_key(event))
-            yield event.plain_result("词条详情读取失败，请重新查询一次。").stop_event()
-            return
-
-        self._pending_clear(self._selection_key(event))
-        if self._supports_forward(event):
-            yield self._build_detail_forward_result(
-                event,
-                row,
-                keyword=pending.keyword,
-                selected_index=index,
-                total=len(pending.titles),
-            ).stop_event()
-            yield self._build_original_wiki_result(event, row).stop_event()
-            return
-
-        yield self._build_detail_result(event, row).stop_event()
-        yield self._build_original_wiki_result(event, row).stop_event()
+        task = asyncio.create_task(self._select_request_async(event, pending, index))
+        self._track_background_task(task)
+        return
 
     @filter.command("洛克状态", alias={"百科状态"})
     async def rocom_status(self, event: AstrMessageEvent):
@@ -856,13 +1566,22 @@ class RocomWikiPlugin(Star):
             yield event.plain_result(err)
             return
 
-        st = self.repo.sqlite_path.stat()
+        data_file = self.repo.sqlite_path if self.repo.sqlite_path.exists() else self.repo.jsonl_path
+        if not data_file.exists():
+            yield event.plain_result("本地数据未就绪，请检查 sqlite_path/jsonl_path 配置。")
+            return
+
+        st = data_file.stat()
         text = (
             "洛克百科插件状态\n"
+            f"当前数据文件：{data_file.name}\n"
             f"文件大小：{st.st_size} 字节\n"
             f"缓存条目：{len(self._cache)}\n"
             f"待选择会话：{len(self._pending)}\n"
-            f"回复模式：{'compact' if self._compact_mode() else 'full'}"
+            f"回复模式：{'compact' if self._compact_mode() else 'full'}\n"
+            f"数据源模式：{self._source_mode()}\n"
+            f"更新模式：{self._update_mode()}\n"
+            f"在线抓取：{'启用' if self._crawler_enabled() else '禁用'}"
         )
         yield event.plain_result(text)
 
@@ -870,17 +1589,20 @@ class RocomWikiPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("洛克重载", alias={"百科重载"})
     async def rocom_reload(self, event: AstrMessageEvent):
+        self._cancel_background_tasks()
         self.repo = RocomRepository(
             sqlite_path=self._resolve_sqlite_path(),
+            jsonl_path=self._resolve_jsonl_path(),
             markdown_root=self._resolve_markdown_root(),
         )
         self._cache.clear()
         self._pending.clear()
-        yield event.plain_result(f"重载完成。当前 sqlite: {self.repo.sqlite_path}")
+        yield event.plain_result(f"重载完成。当前 sqlite: {self.repo.sqlite_path}，jsonl: {self.repo.jsonl_path}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("洛克清缓存", alias={"百科清缓存"})
     async def rocom_clear_cache(self, event: AstrMessageEvent):
+        self._cancel_background_tasks()
         cache_size = len(self._cache)
         pending_size = len(self._pending)
         self._cache.clear()
@@ -890,5 +1612,6 @@ class RocomWikiPlugin(Star):
         )
 
     async def terminate(self):
+        self._cancel_background_tasks()
         self._cache.clear()
         self._pending.clear()

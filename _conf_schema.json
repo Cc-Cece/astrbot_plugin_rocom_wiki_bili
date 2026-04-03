@@ -16,14 +16,14 @@
     "description": "数据来源模式",
     "default": "auto",
     "options": ["auto", "sqlite_only", "jsonl_only", "sqlite_jsonl_merge", "crawler_only"],
-    "hint": "auto: 有哪个查哪个（双存在默认 SQLite）。crawler_only: 只在线抓取，不读本地库。"
+    "hint": "auto: 有哪个查哪个（双存在默认 SQLite）；sqlite_only/jsonl_only: 只查指定库；sqlite_jsonl_merge: 双查后合并去重；crawler_only: 只在线抓取，不读不写 SQLite/JSONL。"
   },
   "update_mode": {
     "type": "string",
     "description": "爬虫更新模式",
     "default": "after_send_compare_update",
     "options": ["after_send_compare_update", "before_send_compare_update", "disabled"],
-    "hint": "after_send_compare_update 为默认：先发结果，再比对更新。"
+    "hint": "after_send_compare_update: 先发后比对并更新本地库；before_send_compare_update: 先比对更新再发送；disabled: 不启用爬虫更新（不影响 source_mode=crawler_only 的在线查询）。"
   },
   "crawler_enabled": {
     "type": "bool",
