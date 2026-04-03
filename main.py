@@ -786,6 +786,7 @@ class RocomWikiPlugin(Star):
         self._cache: dict[str, CacheEntry] = {}
         self._pending: dict[str, PendingSelection] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._inflight_queries: set[str] = set()
         self.repo: RocomRepository | None = None
 
     async def initialize(self):
@@ -1515,7 +1516,12 @@ class RocomWikiPlugin(Star):
         keyword: str,
         selected_index_hint: int | None,
     ) -> None:
-        await self._deliver_query_results_async(event, keyword, selected_index_hint)
+        key = self._selection_key(event)
+        self._inflight_queries.add(key)
+        try:
+            await self._deliver_query_results_async(event, keyword, selected_index_hint)
+        finally:
+            self._inflight_queries.discard(key)
 
     async def _select_request_async(
         self,
@@ -1531,9 +1537,12 @@ class RocomWikiPlugin(Star):
 
     @filter.command("洛克查", alias={"洛克查询", "查百科", "查词条"})
     async def rocom_query(self, event: AstrMessageEvent, keyword: str = ""):
+        event.should_call_llm(True)
+        event.stop_event()
+
         raw_keyword = keyword.strip()
         if not raw_keyword:
-            yield event.plain_result("请输入关键词，例如：洛克查 小独角兽")
+            yield event.plain_result("请输入关键词，例如：洛克查 小独角兽").stop_event()
             return
 
         keyword, selected_index_hint = self._parse_query_message(event, raw_keyword)
@@ -1544,9 +1553,16 @@ class RocomWikiPlugin(Star):
 
     @filter.regex(r"^\s*\d+\s*$")
     async def rocom_select_by_index(self, event: AstrMessageEvent):
-        pending = self._pending_get(self._selection_key(event))
+        selection_key = self._selection_key(event)
+        pending = self._pending_get(selection_key)
         if not pending:
+            if selection_key in self._inflight_queries:
+                event.should_call_llm(True)
+                yield event.plain_result("查询仍在处理中，请稍后再回复序号。").stop_event()
             return
+
+        event.should_call_llm(True)
+        event.stop_event()
 
         err = self._ensure_repo()
         if err:
@@ -1590,6 +1606,7 @@ class RocomWikiPlugin(Star):
     @filter.command("洛克重载", alias={"百科重载"})
     async def rocom_reload(self, event: AstrMessageEvent):
         self._cancel_background_tasks()
+        self._inflight_queries.clear()
         self.repo = RocomRepository(
             sqlite_path=self._resolve_sqlite_path(),
             jsonl_path=self._resolve_jsonl_path(),
@@ -1603,6 +1620,7 @@ class RocomWikiPlugin(Star):
     @filter.command("洛克清缓存", alias={"百科清缓存"})
     async def rocom_clear_cache(self, event: AstrMessageEvent):
         self._cancel_background_tasks()
+        self._inflight_queries.clear()
         cache_size = len(self._cache)
         pending_size = len(self._pending)
         self._cache.clear()
@@ -1613,5 +1631,6 @@ class RocomWikiPlugin(Star):
 
     async def terminate(self):
         self._cancel_background_tasks()
+        self._inflight_queries.clear()
         self._cache.clear()
         self._pending.clear()

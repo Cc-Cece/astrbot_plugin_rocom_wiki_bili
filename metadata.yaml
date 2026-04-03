@@ -2,5 +2,6 @@ name: astrbot_plugin_rocom_wiki_bili
 display_name: 洛克王国:世界 Wiki 查询
 desc: 基于 洛克王国:手游WIKI_BWIKI_哔哩哔哩 的《洛克王国：世界》词条检索插件，支持结构化显示与实时数据更新。
 version: v1.0.2
+icon: icon.png
 author: Cc-Cece
 repo: https://github.com/Cc-Cece/astrbot_plugin_rocom_wiki_bili
