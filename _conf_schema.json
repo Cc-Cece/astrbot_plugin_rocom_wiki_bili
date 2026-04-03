@@ -1,0 +1,87 @@
+{
+  "sqlite_path": {
+    "type": "string",
+    "description": "本地 SQLite 数据路径（建议放插件目录下 data/pages.sqlite）",
+    "default": "data/pages.sqlite",
+    "hint": "如需读取外部文件，可填绝对路径。"
+  },
+  "jsonl_path": {
+    "type": "string",
+    "description": "本地 JSONL 数据路径（建议放插件目录下 data/pages.jsonl）",
+    "default": "data/pages.jsonl",
+    "hint": "如需读取外部文件，可填绝对路径。"
+  },
+  "source_mode": {
+    "type": "string",
+    "description": "数据来源模式",
+    "default": "auto",
+    "options": ["auto", "sqlite_only", "jsonl_only", "sqlite_jsonl_merge", "crawler_only"],
+    "hint": "auto: 有哪个查哪个（双存在默认 SQLite）。crawler_only: 只在线抓取，不读本地库。"
+  },
+  "update_mode": {
+    "type": "string",
+    "description": "爬虫更新模式",
+    "default": "after_send_compare_update",
+    "options": ["after_send_compare_update", "before_send_compare_update", "disabled"],
+    "hint": "after_send_compare_update 为默认：先发结果，再比对更新。"
+  },
+  "crawler_enabled": {
+    "type": "bool",
+    "description": "是否启用在线爬虫能力",
+    "default": true
+  },
+  "crawler_timeout_sec": {
+    "type": "int",
+    "description": "在线抓取超时时间（秒）",
+    "default": 20
+  },
+  "crawler_min_interval_sec": {
+    "type": "int",
+    "description": "两次在线抓取最小间隔（秒）",
+    "default": 5
+  },
+  "crawler_keyword_blocklist": {
+    "type": "string",
+    "description": "在线抓取关键词黑名单（逗号分隔，支持简单模式）",
+    "default": "Help:,Template:,Special:",
+    "hint": "命中黑名单关键词时跳过在线抓取。"
+  },
+  "recall_on_update": {
+    "type": "bool",
+    "description": "发后更新模式中，若平台支持是否尝试撤回旧消息",
+    "default": true
+  },
+  "default_reply_mode": {
+    "type": "string",
+    "description": "默认输出模式",
+    "default": "compact",
+    "options": ["compact", "full"],
+    "hint": "compact 适合群聊，full 会输出更详细内容。"
+  },
+  "query_max_results": {
+    "type": "int",
+    "description": "单次查询最多返回的词条数量（标题包含关键词）",
+    "default": 8
+  },
+  "merge_forward_enabled": {
+    "type": "bool",
+    "description": "是否在长消息时使用合并转发",
+    "default": true
+  },
+  "merge_forward_threshold": {
+    "type": "int",
+    "description": "触发合并转发的字数阈值",
+    "default": 900
+  },
+  "merge_forward_platforms": {
+    "type": "string",
+    "description": "启用合并转发的平台列表（逗号分隔）",
+    "default": "aiocqhttp,onebot",
+    "hint": "示例：aiocqhttp,onebot"
+  },
+  "cache_ttl_sec": {
+    "type": "int",
+    "description": "查询结果缓存时间（秒）",
+    "default": 600
+  }
+}
