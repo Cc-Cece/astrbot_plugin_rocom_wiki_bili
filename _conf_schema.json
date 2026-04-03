@@ -3,27 +3,27 @@
     "type": "string",
     "description": "本地 SQLite 数据路径（建议放插件目录下 data/pages.sqlite）",
     "default": "data/pages.sqlite",
-    "hint": "如需读取外部文件，可填绝对路径。"
+    "hint": "【一般情况下无需修改】如需读取外部文件，可填绝对路径。"
   },
   "jsonl_path": {
     "type": "string",
     "description": "本地 JSONL 数据路径（建议放插件目录下 data/pages.jsonl）",
     "default": "data/pages.jsonl",
-    "hint": "如需读取外部文件，可填绝对路径。"
+    "hint": "【一般情况下无需修改】如需读取外部文件，可填绝对路径。"
   },
   "source_mode": {
     "type": "string",
     "description": "数据来源模式",
     "default": "auto",
     "options": ["auto", "sqlite_only", "jsonl_only", "sqlite_jsonl_merge", "crawler_only"],
-    "hint": "auto: 有哪个查哪个（双存在默认 SQLite）；sqlite_only/jsonl_only: 只查指定库；sqlite_jsonl_merge: 双查后合并去重；crawler_only: 只在线抓取，不读不写 SQLite/JSONL。"
+    "hint": "【推荐：auto】选择数据来源哪里：auto: 有哪个查哪个（双存在默认 SQLite）；sqlite_only/jsonl_only: 只查指定库；sqlite_jsonl_merge: 双查后合并去重；crawler_only: 速度较慢，只在线抓取，不读不写 SQLite/JSONL。"
   },
   "update_mode": {
     "type": "string",
     "description": "爬虫更新模式",
     "default": "after_send_compare_update",
     "options": ["after_send_compare_update", "before_send_compare_update", "disabled"],
-    "hint": "after_send_compare_update: 先发后比对并更新本地库；before_send_compare_update: 先比对更新再发送；disabled: 不启用爬虫更新（不影响 source_mode=crawler_only 的在线查询）。"
+    "hint": "【推荐：after_send_compare_update】使用本地爬虫对数据进行更新：after_send_compare_update: 先发后比对并更新本地库；before_send_compare_update: 先比对更新再发送；disabled: 不启用爬虫更新（不影响 source_mode=crawler_only 的在线查询）。"
   },
   "crawler_enabled": {
     "type": "bool",
@@ -56,7 +56,7 @@
     "description": "默认输出模式",
     "default": "compact",
     "options": ["compact", "full"],
-    "hint": "compact 适合群聊，full 会输出更详细内容。"
+    "hint": "【该功能还未完善】compact 适合群聊，full 会输出更详细内容。"
   },
   "query_max_results": {
     "type": "int",
@@ -66,7 +66,8 @@
   "merge_forward_enabled": {
     "type": "bool",
     "description": "是否在长消息时使用合并转发",
-    "default": true
+    "default": true,
+    "hint": "目前只支持QQ、onebot"
   },
   "merge_forward_threshold": {
     "type": "int",
