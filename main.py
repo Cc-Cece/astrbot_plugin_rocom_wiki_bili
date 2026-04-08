@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import inspect
 import json
-from typing import Any
+from typing import Any, Callable
 from dataclasses import dataclass
 from pathlib import Path
 import re
 from html import unescape
 import sqlite3
+import threading
 import time
 from urllib.parse import quote, unquote
 from urllib.error import HTTPError, URLError
@@ -331,9 +334,17 @@ def _normalize_update_mode(value: str) -> str:
 
 
 class MediaWikiClient:
-    def __init__(self, api_url: str = "https://wiki.biligame.com/rocom/api.php", user_agent: str = "astrbot-plugin-rocom-wiki-bili/1.0.2") -> None:
+    def __init__(
+        self,
+        api_url: str = "https://wiki.biligame.com/rocom/api.php",
+        user_agent: str = "astrbot-plugin-rocom-wiki-bili/1.0.2",
+        timeout: int = 20,
+        request_gate: Callable[[], None] | None = None,
+    ) -> None:
         self.api_url = api_url
         self.user_agent = user_agent
+        self.timeout = max(1, int(timeout))
+        self.request_gate = request_gate
 
     def _headers(self, referer: str | None = None) -> dict[str, str]:
         headers = {
@@ -356,7 +367,9 @@ class MediaWikiClient:
         retries = 3
         for attempt in range(retries):
             try:
-                with urlopen(request, timeout=20) as response:
+                if self.request_gate:
+                    self.request_gate()
+                with urlopen(request, timeout=self.timeout) as response:
                     payload = response.read().decode("utf-8")
                 data = json.loads(payload)
                 return data if isinstance(data, dict) else {}
@@ -372,7 +385,9 @@ class MediaWikiClient:
 
     def get_text(self, url: str, referer: str | None = None) -> str:
         request = Request(url, headers=self._headers(referer))
-        with urlopen(request, timeout=20) as response:
+        if self.request_gate:
+            self.request_gate()
+        with urlopen(request, timeout=self.timeout) as response:
             return response.read().decode("utf-8", errors="replace")
 
     @staticmethod
@@ -552,19 +567,67 @@ class PendingSelection:
 
 
 class RocomRepository:
+    _SQLITE_COLUMN_TYPES: dict[str, str] = {
+        "title": "TEXT",
+        "pageid": "INTEGER",
+        "ns": "INTEGER",
+        "url": "TEXT",
+        "touched": "TEXT",
+        "lastrevid": "INTEGER",
+        "contentmodel": "TEXT",
+        "extract": "TEXT",
+        "wikitext": "TEXT",
+        "categories": "TEXT",
+        "links": "TEXT",
+        "images": "TEXT",
+        "depth": "INTEGER",
+    }
+
     def __init__(self, sqlite_path: Path, jsonl_path: Path, markdown_root: Path) -> None:
         self.sqlite_path = sqlite_path
         self.jsonl_path = jsonl_path
         self.markdown_root = markdown_root
         self._jsonl_records: list[dict[str, Any]] | None = None
+        self._sqlite_lock = threading.RLock()
+        self._jsonl_lock = threading.RLock()
 
     def is_ready(self) -> bool:
         return self.sqlite_path.exists() or self.jsonl_path.exists()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.sqlite_path)
+        connection = sqlite3.connect(self.sqlite_path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
         return connection
+
+    @classmethod
+    def _ensure_sqlite_schema(cls, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pages (
+                title TEXT PRIMARY KEY,
+                pageid INTEGER,
+                ns INTEGER,
+                url TEXT,
+                touched TEXT,
+                lastrevid INTEGER,
+                contentmodel TEXT,
+                extract TEXT,
+                wikitext TEXT,
+                categories TEXT,
+                links TEXT,
+                images TEXT,
+                depth INTEGER
+            )
+            """
+        )
+        existing_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pages)").fetchall()}
+        for column_name, column_type in cls._SQLITE_COLUMN_TYPES.items():
+            if column_name == "title":
+                continue
+            if column_name not in existing_columns:
+                conn.execute(f"ALTER TABLE pages ADD COLUMN {column_name} {column_type}")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_title ON pages(title)")
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -573,8 +636,13 @@ class RocomRepository:
         return {key: row[key] for key in row.keys()}
 
     def _fetch_one(self, query: str, params: tuple[object, ...]) -> dict[str, Any] | None:
-        with self._connect() as conn:
-            row = conn.execute(query, params).fetchone()
+        with self._sqlite_lock:
+            try:
+                with self._connect() as conn:
+                    row = conn.execute(query, params).fetchone()
+            except sqlite3.Error as exc:
+                logger.warning(f"[rocom] SQLite 查询失败（fetch_one）：{exc}")
+                return None
         return self._row_to_dict(row)
 
     def _fetch_many(
@@ -583,16 +651,24 @@ class RocomRepository:
         params: tuple[object, ...],
         limit: int,
     ) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(query, params).fetchall()
+        with self._sqlite_lock:
+            try:
+                with self._connect() as conn:
+                    rows = conn.execute(query, params).fetchall()
+            except sqlite3.Error as exc:
+                logger.warning(f"[rocom] SQLite 查询失败（fetch_many）：{exc}")
+                return []
         return [self._row_to_dict(row) for row in list(rows)[:limit] if row is not None]
 
     def _load_jsonl_records(self) -> list[dict[str, Any]]:
-        if self._jsonl_records is not None:
-            return self._jsonl_records
+        with self._jsonl_lock:
+            if self._jsonl_records is None:
+                self._jsonl_records = self._load_jsonl_records_from_disk_locked()
+            return [dict(item) for item in self._jsonl_records]
+
+    def _load_jsonl_records_from_disk_locked(self) -> list[dict[str, Any]]:
         if not self.jsonl_path.exists():
-            self._jsonl_records = []
-            return self._jsonl_records
+            return []
 
         records: list[dict[str, Any]] = []
         with self.jsonl_path.open("r", encoding="utf-8") as handle:
@@ -605,8 +681,7 @@ class RocomRepository:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(item, dict) and item.get("title"):
-                    records.append(item)
-        self._jsonl_records = records
+                    records.append(dict(item))
         return records
 
     @staticmethod
@@ -682,9 +757,6 @@ class RocomRepository:
             yield self.markdown_root / f"{name}.md"
 
     def _upsert_page_sqlite(self, record: dict[str, Any]) -> bool:
-        if not self.sqlite_path.exists():
-            return False
-
         self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         categories = record.get("categories", [])
         links = record.get("links", [])
@@ -696,71 +768,78 @@ class RocomRepository:
         if not isinstance(images, str):
             images = json.dumps(images, ensure_ascii=False)
 
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO pages (
-                    title, pageid, ns, url, touched, lastrevid, contentmodel,
-                    extract, wikitext, categories, links, images, depth
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(title) DO UPDATE SET
-                    pageid=excluded.pageid,
-                    ns=excluded.ns,
-                    url=excluded.url,
-                    touched=excluded.touched,
-                    lastrevid=excluded.lastrevid,
-                    contentmodel=excluded.contentmodel,
-                    extract=excluded.extract,
-                    wikitext=excluded.wikitext,
-                    categories=excluded.categories,
-                    links=excluded.links,
-                    images=excluded.images,
-                    depth=excluded.depth
-                """,
-                (
-                    record.get("title"),
-                    record.get("pageid"),
-                    record.get("ns"),
-                    record.get("url"),
-                    record.get("touched"),
-                    record.get("lastrevid"),
-                    record.get("contentmodel"),
-                    record.get("extract"),
-                    record.get("wikitext"),
-                    categories,
-                    links,
-                    images,
-                    record.get("depth"),
-                ),
-            )
-            conn.commit()
-        return True
-
-    def _upsert_page_jsonl(self, record: dict[str, Any]) -> bool:
-        if not self.jsonl_path.exists():
+        try:
+            with self._sqlite_lock:
+                with self._connect() as conn:
+                    self._ensure_sqlite_schema(conn)
+                    conn.execute(
+                        """
+                        INSERT INTO pages (
+                            title, pageid, ns, url, touched, lastrevid, contentmodel,
+                            extract, wikitext, categories, links, images, depth
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(title) DO UPDATE SET
+                            pageid=excluded.pageid,
+                            ns=excluded.ns,
+                            url=excluded.url,
+                            touched=excluded.touched,
+                            lastrevid=excluded.lastrevid,
+                            contentmodel=excluded.contentmodel,
+                            extract=excluded.extract,
+                            wikitext=excluded.wikitext,
+                            categories=excluded.categories,
+                            links=excluded.links,
+                            images=excluded.images,
+                            depth=excluded.depth
+                        """,
+                        (
+                            record.get("title"),
+                            record.get("pageid"),
+                            record.get("ns"),
+                            record.get("url"),
+                            record.get("touched"),
+                            record.get("lastrevid"),
+                            record.get("contentmodel"),
+                            record.get("extract"),
+                            record.get("wikitext"),
+                            categories,
+                            links,
+                            images,
+                            record.get("depth"),
+                        ),
+                    )
+                    conn.commit()
+            return True
+        except sqlite3.Error as exc:
+            logger.warning(f"[rocom] SQLite 写入失败：{exc}")
             return False
 
+    def _upsert_page_jsonl(self, record: dict[str, Any]) -> bool:
         self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         title = str(record.get("title") or "").strip()
         if not title:
             return False
 
-        records = self._load_jsonl_records()
-        replaced = False
-        for idx, item in enumerate(records):
-            if str(item.get("title") or "") == title:
-                records[idx] = dict(record)
-                replaced = True
-                break
-        if not replaced:
-            records.append(dict(record))
+        with self._jsonl_lock:
+            if self._jsonl_records is None:
+                self._jsonl_records = self._load_jsonl_records_from_disk_locked()
 
-        with self.jsonl_path.open("w", encoding="utf-8") as handle:
-            for item in records:
-                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+            records = [dict(item) for item in self._jsonl_records]
+            replaced = False
+            for idx, item in enumerate(records):
+                if str(item.get("title") or "") == title:
+                    records[idx] = dict(record)
+                    replaced = True
+                    break
+            if not replaced:
+                records.append(dict(record))
 
-        self._jsonl_records = records
-        return True
+            with self.jsonl_path.open("w", encoding="utf-8") as handle:
+                for item in records:
+                    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+            self._jsonl_records = records
+            return True
 
     def upsert_page(
         self,
@@ -787,6 +866,8 @@ class RocomWikiPlugin(Star):
         self._pending: dict[str, PendingSelection] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._inflight_queries: set[str] = set()
+        self._crawler_gate_lock = threading.Lock()
+        self._last_crawler_request_ts = 0.0
         self.repo: RocomRepository | None = None
 
     async def initialize(self):
@@ -884,9 +965,52 @@ class RocomWikiPlugin(Star):
     def _forward_enabled(self) -> bool:
         return _config_bool(self.config, "merge_forward_enabled", True)
 
+    def _forward_threshold(self) -> int:
+        return max(0, _config_int(self.config, "merge_forward_threshold", 900))
+
     def _forward_platforms(self) -> set[str]:
         raw = _config_str(self.config, "merge_forward_platforms", "aiocqhttp,onebot")
         return {item.lower() for item in _split_csv(raw)}
+
+    def _crawler_keyword_blocklist(self) -> list[str]:
+        raw = _config_str(self.config, "crawler_keyword_blocklist", "Help:,Template:,Special:")
+        return [item for item in _split_csv(raw) if item]
+
+    def _keyword_is_blocked_for_crawler(self, keyword: str) -> bool:
+        normalized = (keyword or "").strip().lower()
+        if not normalized:
+            return False
+        for pattern in self._crawler_keyword_blocklist():
+            p = pattern.strip().lower()
+            if not p:
+                continue
+            if "*" in p or "?" in p:
+                if fnmatch.fnmatch(normalized, p):
+                    return True
+            elif p in normalized:
+                return True
+        return False
+
+    def _wait_for_crawler_slot(self) -> None:
+        min_interval = float(self._crawler_min_interval())
+        if min_interval <= 0:
+            return
+
+        while True:
+            with self._crawler_gate_lock:
+                now = time.monotonic()
+                elapsed = now - self._last_crawler_request_ts
+                if elapsed >= min_interval:
+                    self._last_crawler_request_ts = now
+                    return
+                wait_for = min_interval - elapsed
+            time.sleep(max(0.0, wait_for))
+
+    def _new_mediawiki_client(self) -> MediaWikiClient:
+        return MediaWikiClient(
+            timeout=self._crawler_timeout(),
+            request_gate=self._wait_for_crawler_slot,
+        )
 
     def _query_local_records(self, keyword: str) -> list[dict[str, Any]]:
         if not self.repo:
@@ -927,8 +1051,11 @@ class RocomWikiPlugin(Star):
     def _query_remote_records(self, keyword: str) -> list[dict[str, Any]]:
         if not self._crawler_enabled() or self._source_mode() not in {"auto", "crawler_only"}:
             return []
+        if self._keyword_is_blocked_for_crawler(keyword):
+            logger.info(f"[rocom] 关键词命中在线抓取黑名单，已跳过远程查询：{keyword}")
+            return []
 
-        client = MediaWikiClient()
+        client = self._new_mediawiki_client()
         try:
             titles = client.search_titles(keyword, limit=self._query_limit())
         except Exception as exc:
@@ -950,8 +1077,11 @@ class RocomWikiPlugin(Star):
     def _fetch_remote_page(self, title: str) -> dict[str, Any] | None:
         if not self._crawler_enabled():
             return None
+        if self._keyword_is_blocked_for_crawler(title):
+            logger.info(f"[rocom] 词条命中在线抓取黑名单，已跳过远程刷新：{title}")
+            return None
         try:
-            record = MediaWikiClient().page(title)
+            record = self._new_mediawiki_client().page(title)
         except Exception as exc:
             logger.warning(f"[rocom] 在线抓取详情失败：{title} -> {exc}")
             return None
@@ -959,16 +1089,39 @@ class RocomWikiPlugin(Star):
         return record
 
     @staticmethod
+    def _normalize_record_list_field(value: Any) -> list[str]:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    @classmethod
+    def _normalize_record_for_compare(cls, record: dict[str, Any] | None) -> dict[str, Any]:
+        if not record:
+            return {}
+        normalized = dict(record)
+        for list_key in ("categories", "links", "images"):
+            normalized[list_key] = cls._normalize_record_list_field(normalized.get(list_key))
+        return normalized
+
+    @staticmethod
     def _record_revision(record: dict[str, Any] | None) -> str:
         if not record:
             return ""
         return str(record.get("lastrevid") or record.get("touched") or "")
 
-    @staticmethod
-    def _record_payload(record: dict[str, Any] | None) -> str:
-        if not record:
-            return ""
-        return json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+    @classmethod
+    def _record_payload(cls, record: dict[str, Any] | None) -> str:
+        return json.dumps(cls._normalize_record_for_compare(record), ensure_ascii=False, sort_keys=True, default=str)
 
     def _record_needs_update(self, local_record: dict[str, Any], remote_record: dict[str, Any]) -> bool:
         local_rev = self._record_revision(local_record)
@@ -998,6 +1151,8 @@ class RocomWikiPlugin(Star):
         title = str(record.get("title") or "")
         if not title:
             return record, False
+        if self._keyword_is_blocked_for_crawler(title):
+            return record, False
 
         remote_record = self._fetch_remote_page(title)
         if not remote_record:
@@ -1007,8 +1162,11 @@ class RocomWikiPlugin(Star):
             return remote_record, True
         return record, False
 
-    def _supports_forward(self, event: AstrMessageEvent) -> bool:
+    def _supports_forward(self, event: AstrMessageEvent, detail_text: str) -> bool:
         if not self._forward_enabled():
+            return False
+        threshold = self._forward_threshold()
+        if threshold > 0 and len(detail_text) < threshold:
             return False
         platform = (event.get_platform_name() or "").lower()
         return platform in self._forward_platforms()
@@ -1257,14 +1415,14 @@ class RocomWikiPlugin(Star):
                 lines.append(_shorten(extra_body, 1200))
         return "\n".join(lines)
 
-    def _build_detail_chain(self, row: sqlite3.Row):
+    def _build_detail_chain(self, row: sqlite3.Row, detail_text: str | None = None):
         title = str(row["title"] or "")
         wikitext = str(row["wikitext"] or "")
         chain = []
         image_comp = self._find_main_image_component(title, wikitext)
         if image_comp is not None:
             chain.append(image_comp)
-        chain.append(Plain(self._format_detail_text(row)))
+        chain.append(Plain(detail_text if detail_text is not None else self._format_detail_text(row)))
         return chain
 
     def _build_original_wiki_text(self, row: sqlite3.Row) -> str:
@@ -1275,9 +1433,9 @@ class RocomWikiPlugin(Star):
     def _build_original_wiki_result(self, event: AstrMessageEvent, row: sqlite3.Row):
         return event.plain_result(self._build_original_wiki_text(row))
 
-    def _build_detail_result(self, event: AstrMessageEvent, row: sqlite3.Row):
+    def _build_detail_result(self, event: AstrMessageEvent, row: sqlite3.Row, detail_text: str | None = None):
         result = event.make_result()
-        result.chain.extend(self._build_detail_chain(row))
+        result.chain.extend(self._build_detail_chain(row, detail_text=detail_text))
         return result
 
     def _build_detail_forward_result(
@@ -1287,6 +1445,7 @@ class RocomWikiPlugin(Star):
         keyword: str = "",
         selected_index: int | None = None,
         total: int | None = None,
+        detail_text: str | None = None,
     ):
         title = str(row["title"] or "")
         nodes: list[Node] = []
@@ -1310,7 +1469,7 @@ class RocomWikiPlugin(Star):
             Node(
                 uin=event.get_self_id(),
                 name="洛克百科",
-                content=self._build_detail_chain(row),
+                content=self._build_detail_chain(row, detail_text=detail_text),
             )
         )
 
@@ -1326,7 +1485,7 @@ class RocomWikiPlugin(Star):
         result.chain.append(Nodes(nodes))
         return result
 
-    def _ensure_repo(self) -> str | None:
+    def _ensure_repo(self, *, allow_remote_fallback: bool = False) -> str | None:
         if self._source_mode() == "crawler_only":
             return None
         if self.repo is None:
@@ -1335,13 +1494,15 @@ class RocomWikiPlugin(Star):
                 jsonl_path=self._resolve_jsonl_path(),
                 markdown_root=self._resolve_markdown_root(),
             )
-        if not self.repo.is_ready():
-            return (
-                "本地数据未就绪，请检查 sqlite_path/jsonl_path 配置。\n"
-                f"SQLite：{self.repo.sqlite_path}\n"
-                f"JSONL：{self.repo.jsonl_path}"
-            )
-        return None
+        if self.repo.is_ready():
+            return None
+        if allow_remote_fallback and self._allow_remote_search():
+            return None
+        return (
+            "本地数据未就绪，请检查 sqlite_path/jsonl_path 配置。\n"
+            f"SQLite：{self.repo.sqlite_path}\n"
+            f"JSONL：{self.repo.jsonl_path}"
+        )
 
     def _selection_key(self, event: AstrMessageEvent) -> str:
         return f"{event.get_session_id()}::{event.get_sender_id() or '-'}"
@@ -1370,12 +1531,34 @@ class RocomWikiPlugin(Star):
             task.cancel()
         self._background_tasks.clear()
 
-    async def _send_result(self, event: AstrMessageEvent, result: Any) -> None:
-        await event.send(result)
+    async def _send_result(self, event: AstrMessageEvent, result: Any) -> Any:
+        return await event.send(result)
 
-    async def _send_results(self, event: AstrMessageEvent, results: list[Any]) -> None:
+    async def _send_results(self, event: AstrMessageEvent, results: list[Any]) -> list[Any]:
+        sent_messages: list[Any] = []
         for result in results:
-            await self._send_result(event, result)
+            sent_messages.append(await self._send_result(event, result))
+        return sent_messages
+
+    async def _try_recall_sent_message(self, sent_message: Any) -> bool:
+        candidates = list(sent_message) if isinstance(sent_message, (list, tuple, set)) else [sent_message]
+        recall_methods = ("recall", "revoke", "withdraw", "delete", "retract")
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for method_name in recall_methods:
+                method = getattr(candidate, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    outcome = method()
+                    if inspect.isawaitable(outcome):
+                        await outcome
+                    return True
+                except Exception:
+                    continue
+        return False
 
     def _build_detail_delivery_result(
         self,
@@ -1385,16 +1568,18 @@ class RocomWikiPlugin(Star):
         selected_index: int | None = None,
         total: int | None = None,
     ):
-        if self._supports_forward(event):
+        detail_text = self._format_detail_text(row)
+        if self._supports_forward(event, detail_text):
             return self._build_detail_forward_result(
                 event,
                 row,
                 keyword=keyword,
                 selected_index=selected_index,
                 total=total,
+                detail_text=detail_text,
             )
 
-        result = self._build_detail_result(event, row)
+        result = self._build_detail_result(event, row, detail_text=detail_text)
         result.chain.append(Plain(f"\n{self._build_original_wiki_text(row)}"))
         return result
 
@@ -1420,7 +1605,7 @@ class RocomWikiPlugin(Star):
         if self._update_mode() == "before_send_compare_update":
             record, _ = await self._refresh_record_if_needed_async(record)
 
-        await self._send_result(
+        first_sent = await self._send_result(
             event,
             self._build_detail_delivery_result(
                 event,
@@ -1432,7 +1617,23 @@ class RocomWikiPlugin(Star):
         )
 
         if self._update_mode() == "after_send_compare_update":
-            await self._refresh_record_if_needed_async(record)
+            refreshed_record, updated = await self._refresh_record_if_needed_async(record)
+            if updated:
+                recalled = False
+                if self._recall_on_update():
+                    recalled = await self._try_recall_sent_message(first_sent)
+                if self._recall_on_update() and not recalled:
+                    await self._send_result(event, event.plain_result("检测到词条已更新，以下为最新内容。"))
+                await self._send_result(
+                    event,
+                    self._build_detail_delivery_result(
+                        event,
+                        refreshed_record,
+                        keyword=keyword,
+                        selected_index=selected_index,
+                        total=total,
+                    ).stop_event(),
+                )
 
     async def _deliver_query_results_async(
         self,
@@ -1440,7 +1641,7 @@ class RocomWikiPlugin(Star):
         keyword: str,
         selected_index_hint: int | None,
     ) -> None:
-        err = self._ensure_repo()
+        err = self._ensure_repo(allow_remote_fallback=True)
         if err:
             await self._send_result(event, event.plain_result(err))
             return
@@ -1564,7 +1765,7 @@ class RocomWikiPlugin(Star):
         event.should_call_llm(True)
         event.stop_event()
 
-        err = self._ensure_repo()
+        err = self._ensure_repo(allow_remote_fallback=True)
         if err:
             yield event.plain_result(err).stop_event()
             return
@@ -1577,14 +1778,24 @@ class RocomWikiPlugin(Star):
 
     @filter.command("洛克状态", alias={"百科状态"})
     async def rocom_status(self, event: AstrMessageEvent):
-        err = self._ensure_repo()
+        err = self._ensure_repo(allow_remote_fallback=True)
         if err:
             yield event.plain_result(err)
             return
 
         data_file = self.repo.sqlite_path if self.repo.sqlite_path.exists() else self.repo.jsonl_path
         if not data_file.exists():
-            yield event.plain_result("本地数据未就绪，请检查 sqlite_path/jsonl_path 配置。")
+            text = (
+                "洛克百科插件状态\n"
+                "当前数据文件：未就绪（将按配置尝试在线抓取）\n"
+                f"缓存条目：{len(self._cache)}\n"
+                f"待选择会话：{len(self._pending)}\n"
+                f"回复模式：{'compact' if self._compact_mode() else 'full'}\n"
+                f"数据源模式：{self._source_mode()}\n"
+                f"更新模式：{self._update_mode()}\n"
+                f"在线抓取：{'启用' if self._crawler_enabled() else '禁用'}"
+            )
+            yield event.plain_result(text)
             return
 
         st = data_file.stat()
